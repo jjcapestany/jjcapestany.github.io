@@ -1,11 +1,11 @@
 import {createHashRouter} from "react-router-dom";
-import LandingPage from "../components/LandingPage.tsx";
 import AboutMe from "../components/AboutMe.tsx";
+import DevDesignPairing from "../components/DevDesignPairing.tsx";
 
 export const router = createHashRouter([
     {
         path: "/",
-        element:<LandingPage/>,
+        element:<DevDesignPairing/>,
     },
     {
         path: "/about-me",
