@@ -4,11 +4,13 @@ import './index.css'
 import {RouterProvider} from "react-router-dom";
 import {router} from "./routes/ApplicationRoutes.tsx";
 import ResponsiveAppBar from "./components/ResponsiveAppBar.tsx";
+import DevDesignPairing from "./components/DevDesignPairing.tsx";
 
 
 createRoot(document.getElementById('root')!).render(
     <StrictMode>
-        <ResponsiveAppBar/>
-        <RouterProvider router={router}/>
+        {/*<ResponsiveAppBar/>*/}
+        {/*<RouterProvider router={router}/>*/}
+      <DevDesignPairing/>
     </StrictMode>,
 )
