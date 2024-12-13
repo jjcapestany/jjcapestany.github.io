@@ -51,7 +51,7 @@ function DevDesignPairing() {
                       updatedArray[index] = true;
                       setIsFlipped(updatedArray)
                     }}
-                  >{index}</Button>
+                  >{index+1}</Button>
                 </CardContent>
               </Card>
             }
