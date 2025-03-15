@@ -8,7 +8,7 @@ import ResponsiveAppBar from "./components/ResponsiveAppBar.tsx";
 
 createRoot(document.getElementById('root')!).render(
     <StrictMode>
-        <ResponsiveAppBar/>
+        {/*<ResponsiveAppBar/>*/}
         <RouterProvider router={router}/>
     </StrictMode>,
 )
