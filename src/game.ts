@@ -614,12 +614,12 @@ export class Game {
     this.drawItems(ctx);
   }
 
-  // Bottom-right tray: one slot per item, filling in as you collect uniques.
+  // Bottom-right tray: 3 slots that fill in as you collect unique items.
   private drawItems(ctx: CanvasRenderingContext2D): void {
+    const slots = 3;
     const box = 44;
     const gap = 8;
-    const n = ITEMS.length;
-    const x0 = W - 18 - (n * box + (n - 1) * gap);
+    const x0 = W - 18 - (slots * box + (slots - 1) * gap);
     const y0 = H - 18 - box;
 
     ctx.textAlign = 'left';
@@ -628,9 +628,9 @@ export class Game {
     ctx.fillText('ITEMS', x0, y0 - 7);
 
     let hovered = -1;
-    for (let i = 0; i < n; i++) {
-      const def = ITEMS[i];
-      const lvl = this.player.getItemLevel(def.id);
+    for (let i = 0; i < slots; i++) {
+      const eq = this.player.equipped[i];
+      const def = eq ? ITEMS.find((it) => it.id === eq.id) : undefined;
       const bx = x0 + i * (box + gap);
       const over =
         this.input.mouseX >= bx &&
@@ -638,63 +638,121 @@ export class Game {
         this.input.mouseY >= y0 &&
         this.input.mouseY <= y0 + box;
 
-      ctx.fillStyle = lvl > 0 ? '#171226' : 'rgba(0, 0, 0, 0.4)';
+      ctx.fillStyle = def ? '#171226' : 'rgba(0, 0, 0, 0.4)';
       ctx.fillRect(bx, y0, box, box);
-      ctx.lineWidth = lvl > 0 && over ? 3 : 2;
-      ctx.strokeStyle = lvl > 0 ? def.color : '#3a3a44';
+      ctx.lineWidth = def && over ? 3 : 2;
+      ctx.strokeStyle = def ? def.color : '#3a3a44';
       ctx.strokeRect(bx, y0, box, box);
 
-      if (lvl > 0) {
+      if (def && eq) {
         this.drawItemIcon(ctx, def.id, bx + box / 2, y0 + box / 2 - 1, def.color);
         // level number in the bottom-right corner
         ctx.textAlign = 'right';
         ctx.fillStyle = '#fff3b0';
         ctx.font = `8px ${FONT}`;
-        ctx.fillText(String(lvl), bx + box - 4, y0 + box - 4);
+        ctx.fillText(String(eq.level), bx + box - 4, y0 + box - 4);
         if (over) hovered = i;
       }
     }
 
-    if (hovered >= 0) this.drawItemTooltip(ctx, ITEMS[hovered], y0);
+    if (hovered >= 0) {
+      const def = ITEMS.find((it) => it.id === this.player.equipped[hovered].id)!;
+      this.drawItemTooltip(ctx, def, y0);
+    }
     ctx.textAlign = 'left';
   }
 
+  // Cheese-themed pixel icons for each attack item.
   private drawItemIcon(ctx: CanvasRenderingContext2D, id: string, cx: number, cy: number, color: string): void {
-    if (id === 'rind') {
-      // health cross
-      ctx.fillStyle = color;
-      ctx.fillRect(cx - 3, cy - 9, 6, 18);
-      ctx.fillRect(cx - 9, cy - 3, 18, 6);
-    } else if (id === 'edge') {
-      // little sword
-      ctx.fillStyle = '#cfd2e0';
-      ctx.fillRect(cx - 2, cy - 11, 4, 15);
-      ctx.fillStyle = '#d9a441';
-      ctx.fillRect(cx - 6, cy + 3, 12, 3);
-      ctx.fillStyle = '#6b4423';
-      ctx.fillRect(cx - 1, cy + 6, 2, 5);
-    } else if (id === 'whey') {
-      // lightning bolt (speed)
-      ctx.fillStyle = color;
+    const wedge = (yColor: string) => {
+      ctx.fillStyle = yColor;
       ctx.beginPath();
-      ctx.moveTo(cx + 3, cy - 11);
-      ctx.lineTo(cx - 7, cy + 2);
-      ctx.lineTo(cx - 1, cy + 2);
-      ctx.lineTo(cx - 3, cy + 11);
-      ctx.lineTo(cx + 7, cy - 3);
-      ctx.lineTo(cx + 1, cy - 3);
+      ctx.moveTo(cx - 9, cy + 7);
+      ctx.lineTo(cx + 9, cy + 7);
+      ctx.lineTo(cx + 9, cy - 4);
       ctx.closePath();
       ctx.fill();
-    } else {
-      // concentric rings (aura)
+      ctx.fillStyle = '#cf8f0c';
+      ctx.beginPath();
+      ctx.arc(cx + 2, cy + 3, 1.6, 0, Math.PI * 2);
+      ctx.fill();
+    };
+
+    if (id === 'aura') {
+      // cheese wedge with rising stink lines
+      wedge('#ffd23f');
       ctx.strokeStyle = color;
       ctx.lineWidth = 2;
       ctx.beginPath();
-      ctx.arc(cx, cy, 10, 0, Math.PI * 2);
+      ctx.moveTo(cx - 5, cy - 6);
+      ctx.quadraticCurveTo(cx - 2, cy - 9, cx - 5, cy - 12);
       ctx.stroke();
       ctx.beginPath();
-      ctx.arc(cx, cy, 5, 0, Math.PI * 2);
+      ctx.moveTo(cx + 1, cy - 7);
+      ctx.quadraticCurveTo(cx + 4, cy - 10, cx + 1, cy - 13);
       ctx.stroke();
+    } else if (id === 'wheels') {
+      // cheese wheel with a cut slice
+      ctx.fillStyle = '#ffd23f';
+      ctx.beginPath();
+      ctx.arc(cx, cy, 11, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#171226';
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.arc(cx, cy, 11, -0.5, 0.5);
+      ctx.closePath();
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#e0a818';
+      ctx.beginPath();
+      ctx.arc(cx, cy, 11, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.fillStyle = '#cf8f0c';
+      ctx.beginPath();
+      ctx.arc(cx - 3, cy - 2, 1.6, 0, Math.PI * 2);
+      ctx.fill();
+    } else if (id === 'nova') {
+      // bursting cheese core
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      for (let k = 0; k < 8; k++) {
+        const a = (k * Math.PI) / 4;
+        ctx.beginPath();
+        ctx.moveTo(cx + Math.cos(a) * 6, cy + Math.sin(a) * 6);
+        ctx.lineTo(cx + Math.cos(a) * 12, cy + Math.sin(a) * 12);
+        ctx.stroke();
+      }
+      ctx.fillStyle = '#ffd23f';
+      ctx.beginPath();
+      ctx.arc(cx, cy, 5, 0, Math.PI * 2);
+      ctx.fill();
+    } else if (id === 'bolts') {
+      // curd glob with a streak
+      ctx.strokeStyle = '#e0a818';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(cx - 12, cy + 7);
+      ctx.lineTo(cx - 1, cy + 1);
+      ctx.stroke();
+      ctx.fillStyle = '#fff3b0';
+      ctx.beginPath();
+      ctx.arc(cx + 3, cy - 2, 7, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#cf8f0c';
+      ctx.beginPath();
+      ctx.arc(cx + 1, cy - 3, 1.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(cx + 5, cy, 1.3, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      // crumbs — scattered cheese bits
+      ctx.fillStyle = color;
+      ctx.fillRect(cx - 10, cy - 2, 5, 5);
+      ctx.fillRect(cx - 2, cy - 7, 6, 6);
+      ctx.fillRect(cx + 4, cy + 2, 5, 5);
+      ctx.fillRect(cx - 4, cy + 4, 4, 4);
     }
   }
 
