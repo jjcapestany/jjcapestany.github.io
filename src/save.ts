@@ -12,6 +12,8 @@ export interface SaveData {
   lastSpec: string | null;
   unlocked: string[]; // spec ids the player has access to
   runs: Record<string, number>; // spec id -> times played
+  pages: number[]; // journal page ids the player has collected (1-99)
+  bestRooms: number; // furthest a single run has explored
 }
 
 function defaults(): SaveData {
@@ -22,6 +24,8 @@ function defaults(): SaveData {
     lastSpec: null,
     unlocked: SPECS.map((s) => s.id), // everything unlocked for now
     runs: {},
+    pages: [],
+    bestRooms: 0,
   };
 }
 

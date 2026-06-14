@@ -4,6 +4,7 @@ export class Input {
   mouseY = 300;
   mouseDown = false;
   private clicked = false;
+  private consumed = new Set<string>(); // keys already reported by consumeKey this press
 
   constructor(canvas: HTMLCanvasElement) {
     window.addEventListener('keydown', (e) => {
@@ -12,8 +13,15 @@ export class Input {
         e.preventDefault();
       }
     });
-    window.addEventListener('keyup', (e) => this.keys.delete(e.key.toLowerCase()));
-    window.addEventListener('blur', () => this.keys.clear());
+    window.addEventListener('keyup', (e) => {
+      const k = e.key.toLowerCase();
+      this.keys.delete(k);
+      this.consumed.delete(k);
+    });
+    window.addEventListener('blur', () => {
+      this.keys.clear();
+      this.consumed.clear();
+    });
 
     canvas.addEventListener('mousemove', (e) => {
       const r = canvas.getBoundingClientRect();
@@ -36,5 +44,16 @@ export class Input {
     const c = this.clicked;
     this.clicked = false;
     return c;
+  }
+
+  // Edge-triggered key: true once per physical press, not every frame it's held.
+  consumeKey(...keys: string[]): boolean {
+    for (const k of keys) {
+      if (this.keys.has(k) && !this.consumed.has(k)) {
+        this.consumed.add(k);
+        return true;
+      }
+    }
+    return false;
   }
 }

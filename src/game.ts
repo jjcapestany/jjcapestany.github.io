@@ -1,14 +1,19 @@
 import { W, H, WALL, DOOR_HALF } from './constants';
 import { Input } from './input';
-import { Player, Arrow, Explosion, Enemy, SWORD_REACH } from './entities';
+import { Player, Arrow, Explosion, Enemy, Boss, BOSSES, EnemyBullet, Particle, PagePickup, HealPickup, SWORD_REACH, type EnemyKind } from './entities';
 import { Room } from './room';
 import { SPECS, type Spec } from './specs';
 import { ITEMS, type Item } from './items';
-import { loadSave, writeSave, totalRuns, type SaveData } from './save';
+import { TOTAL_PAGES } from './journal';
+import { ItemAttacks } from './systems/item-attacks';
+import { loadSave, writeSave, type SaveData } from './save';
+import { FONT, cardRect, confirmRect, journalButtonRect, pointIn } from './ui/layout';
+import { drawFloaters, drawMinimap, drawStatus, drawItems, drawBoss, type Floater } from './ui/hud';
+import { drawSelect, drawPowerup, drawWon, drawGameOver } from './ui/screens';
+import { drawJournal, journalCellAt, journalBackRect } from './ui/journal';
 
-type Phase = 'select' | 'playing' | 'powerup';
+type Phase = 'select' | 'playing' | 'powerup' | 'won' | 'journal' | 'gameover';
 
-const FONT = '"Press Start 2P", monospace';
 const ARROW_DMG = 2;
 const SWORD_DMG = 3;
 const BLAST_DMG = 3;
@@ -37,17 +42,28 @@ export class Game {
   private milestoneLevel = 0;
   private powerupOptions: Item[] = [];
   private selectedPowerup = -1; // highlighted but not yet confirmed
-  // automatic attack-item state
-  private auraTick = 0;
-  private wheelAngle = 0;
-  private wheelTick = 0;
-  private novaTick = 0;
-  private boltTick = 0;
-  private crumbTick = 0;
-  private crumbDmgTick = 0;
-  private curdBolts: { x: number; y: number; angle: number; life: number }[] = [];
-  private crumbs: { x: number; y: number; life: number }[] = [];
-  private rings: { x: number; y: number; t: number; dur: number; r: number; color: string }[] = [];
+  private powerupTitle = ''; // overrides the LEVEL header for boss rewards
+  // boss / Pretender Melt state
+  private bossesDefeated = 0;
+  private bossActive = false; // current room is an uncleared boss arena (doors sealed)
+  // journal / collectibles
+  private journalReturn: Phase = 'select'; // where closing the journal goes back to
+  private journalViewing = -1; // page id being read, or -1 for the grid
+  private toast = { text: '', sub: '', life: 0 }; // brief banner (page found / healed)
+  // run stats (for the game-over screen)
+  private enemiesDefeated = 0;
+  private pagesFoundThisRun = 0;
+  private runStart = 0; // this.time at the start of the run
+  private newBest = false;
+  private gameOverAt = 0; // this.time when the run ended (input locked briefly after)
+  // automatic attack-items (own their own state + rendering)
+  private items = new ItemAttacks();
+  // enemy fire + juice
+  private enemyBullets: EnemyBullet[] = [];
+  private particles: Particle[] = [];
+  private damageNumbers: Floater[] = [];
+  private shake = 0;
+  private hitStop = 0;
 
   constructor(canvas: HTMLCanvasElement) {
     this.input = new Input(canvas);
@@ -64,10 +80,24 @@ export class Game {
   private populate(room: Room): void {
     if (room.populated) return;
     room.populated = true;
+    // a library is a calm bonus room: no vermin, one page waiting in the centre
+    if (room.isLibrary) {
+      const id = this.pickUncollectedPage();
+      if (id !== null) room.pages.push(new PagePickup(W / 2, H / 2, id));
+      return;
+    }
+    // a safe room: no vermin, a one-time heal in the centre
+    if (room.isSafe) {
+      room.heal = new HealPickup(W / 2, H / 2);
+      return;
+    }
     if (room.rx === 0 && room.ry === 0) return;
     const difficulty = this.roomsExplored;
     const tier = Math.floor(this.roomsExplored / 15); // big jump every 15 rooms
-    const count = 2 + Math.min(2, tier); // fewer enemies, tankier ones
+    // room crowd scales with character level: 2-4 at lv1-9, 3-5 at 10-19, 4-6 at
+    // 20-29, and so on (+1 to the band every 10 levels)
+    const band = Math.floor(this.player.level / 10);
+    const count = 2 + band + Math.floor(Math.random() * 3);
     const safe = 170; // keep enemies away from where the player just entered
     for (let i = 0; i < count; i++) {
       let x = 0;
@@ -78,8 +108,43 @@ export class Game {
         y = WALL + 40 + Math.random() * (H - 2 * WALL - 80);
         tries++;
       } while (Math.hypot(x - this.player.x, y - this.player.y) < safe && tries < 24);
-      room.enemies.push(new Enemy(x, y, difficulty, tier));
+      room.enemies.push(new Enemy(x, y, difficulty, tier, this.pickKind(difficulty, tier)));
     }
+  }
+
+  private pickUncollectedPage(): number | null {
+    const have = new Set(this.save.pages);
+    // also avoid duplicating a page already lying in a currently-live room
+    for (const r of this.rooms.values()) for (const p of r.pages) have.add(p.pageId);
+    const free: number[] = [];
+    for (let id = 1; id <= TOTAL_PAGES; id++) if (!have.has(id)) free.push(id);
+    if (free.length === 0) return null;
+    return free[Math.floor(Math.random() * free.length)];
+  }
+
+  // Weighted enemy-type pool: chasers always, fancier archetypes mixed in as you
+  // explore deeper so each room becomes a different problem.
+  private pickKind(difficulty: number, tier: number): EnemyKind {
+    const pool: EnemyKind[] = ['chaser', 'chaser'];
+    if (difficulty >= 2) pool.push('darter', 'spitter');
+    if (difficulty >= 5) pool.push('splitter');
+    if (difficulty >= 8 || tier >= 1) pool.push('bruiser');
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
+
+  // True when the next Pretender Melt is owed: you've explored deep enough to
+  // reach the threshold of the boss you haven't beaten yet.
+  private bossDue(): boolean {
+    if (this.bossActive || this.bossesDefeated >= BOSSES.length) return false;
+    return this.roomsExplored >= BOSSES[this.bossesDefeated].threshold;
+  }
+
+  // Turn the current room into a sealed boss arena: no vermin, just the boss.
+  private setupBossRoom(): void {
+    const cfg = BOSSES[this.bossesDefeated];
+    this.room.populated = true;
+    this.room.enemies = [new Boss(W / 2, H * 0.32, this.roomsExplored, cfg)];
+    this.bossActive = true;
   }
 
   // Drop rooms more than 2 away from the player so only a 5x5 window persists.
@@ -96,7 +161,8 @@ export class Game {
     const key = `${rx},${ry}`;
     let room = this.rooms.get(key);
     if (!room) {
-      room = new Room(rx, ry);
+      // depth = how far you've pushed; sets the room's themed zone
+      room = new Room(rx, ry, this.roomsExplored);
       this.rooms.set(key, room);
     }
     return room;
@@ -105,13 +171,16 @@ export class Game {
   private changeRoom(dx: number, dy: number, newX: number, newY: number): void {
     this.rx += dx;
     this.ry += dy;
-    // only count genuinely new rooms (a fresh one, or one regenerated after it
-    // scrolled out of the window) — backtracking within the 5x5 is free
-    if (!this.rooms.has(`${this.rx},${this.ry}`)) this.roomsExplored += 1;
+    const isNew = !this.rooms.has(`${this.rx},${this.ry}`);
     this.room = this.getRoom(this.rx, this.ry);
+    const special = this.room.isLibrary || this.room.isSafe;
+    // count genuinely new rooms toward difficulty, but special rooms (library /
+    // safe) are free bonus stops — they never ramp the danger
+    if (isNew && !special) this.roomsExplored += 1;
     this.player.x = newX;
     this.player.y = newY;
-    this.populate(this.room); // after positioning, so enemies avoid the entrance
+    if (this.bossDue() && !special) this.setupBossRoom();
+    else this.populate(this.room); // after positioning, so enemies avoid the entrance
     this.pruneRooms(); // keep only the 5x5 window centred on the player
     this.clearEffects(); // effects don't follow you between rooms
   }
@@ -119,9 +188,10 @@ export class Game {
   private clearEffects(): void {
     this.arrows = [];
     this.explosions = [];
-    this.curdBolts = [];
-    this.crumbs = [];
-    this.rings = [];
+    this.items.clear();
+    this.enemyBullets = [];
+    this.particles = [];
+    this.damageNumbers = [];
   }
 
   // Keep the player inside the walls, but let them step through an existing
@@ -135,7 +205,9 @@ export class Game {
     const maxY = H - WALL - r;
     const inDoorX = Math.abs(p.x - W / 2) < DOOR_HALF;
     const inDoorY = Math.abs(p.y - H / 2) < DOOR_HALF;
-    const doors = this.room.doors;
+    // every door is shut while the room is locked: a boss arena, or any room
+    // that still has living enemies — clear it to move on
+    const doors = this.roomLocked() ? { north: false, east: false, south: false, west: false } : this.room.doors;
 
     if (p.x < minX) {
       if (inDoorY && doors.west) return this.changeRoom(-1, 0, maxX, p.y);
@@ -164,8 +236,29 @@ export class Game {
       this.updatePowerup();
       return;
     }
+    if (this.phase === 'won') {
+      if (this.input.consumeClick() || this.input.isDown('enter')) this.phase = 'select';
+      return;
+    }
+    if (this.phase === 'gameover') {
+      const click = this.input.consumeClick(); // consume + discard during the lock
+      if (this.gameOverReady && (click || this.input.consumeKey('enter'))) this.phase = 'select';
+      return;
+    }
+    if (this.phase === 'journal') {
+      this.updateJournal();
+      return;
+    }
+    if (this.toast.life > 0) this.toast.life -= dt;
+    this.shake = Math.max(0, this.shake - dt * 40);
+    // brief freeze on impactful hits for punch — everything else holds still
+    if (this.hitStop > 0) {
+      this.hitStop -= dt;
+      return;
+    }
     this.player.update(dt, this.input);
     this.updateBounds();
+    if (this.phase !== 'playing') return; // a door may have led into the library/boss
     this.handleFiring();
     this.updateArrows(dt);
     for (const ex of this.explosions) ex.update(dt);
@@ -173,151 +266,183 @@ export class Game {
     this.updateEnemies(dt);
     this.applySwordHits();
     this.updateItemAttacks(dt);
+    this.updateEnemyBullets(dt);
+    this.updateFloaters(dt);
+    this.updatePages(dt);
     this.reapEnemies();
-    this.checkMilestone();
+    // a boss death may have already opened a reward/win screen this frame
+    if (this.phase === 'playing') this.checkMilestone();
   }
 
-  // Automatic attack-items that damage enemies on their own, independent of your
-  // weapon. Each is driven here off the equipped item levels.
+  // Float the room's pages, collect any the player walks onto (saved
+  // immediately so it survives leaving the site), and open the journal when the
+  // player reads at the library desk.
+  private updatePages(dt: number): void {
+    const p = this.player;
+    for (const pg of this.room.pages) pg.update(dt);
+    // collection
+    const remaining: PagePickup[] = [];
+    for (const pg of this.room.pages) {
+      if (Math.hypot(p.x - pg.x, p.y - pg.y) < p.radius + pg.radius) {
+        if (!this.save.pages.includes(pg.pageId)) {
+          this.save.pages.push(pg.pageId);
+          writeSave(this.save);
+        }
+        this.pagesFoundThisRun += 1;
+        this.toast = { text: `PAGE ${pg.pageId} FOUND`, sub: 'READ IT IN A LIBRARY OR ON THE START SCREEN', life: 2.5 };
+      } else {
+        remaining.push(pg);
+      }
+    }
+    this.room.pages = remaining;
+
+    // the Pilot Light — rest on it once, while hurt, to heal half your max HP
+    const heal = this.room.heal;
+    if (heal) {
+      heal.update(dt);
+      if (
+        !heal.used &&
+        p.hp < p.maxHp &&
+        Math.hypot(p.x - heal.x, p.y - heal.y) < p.radius + heal.radius
+      ) {
+        heal.used = true;
+        p.hp = Math.min(p.maxHp, p.hp + p.maxHp * 0.5);
+        for (let i = 0; i < 16; i++) this.particles.push(new Particle(heal.x, heal.y - 6, '#5ad36a'));
+        this.toast = { text: 'THE PILOT LIGHT WARMS YOU', sub: 'HP RESTORED', life: 2.5 };
+      }
+    }
+
+    // read at the library desk
+    if (this.room.isLibrary && Math.hypot(p.x - W / 2, p.y - (H / 2 + 30)) < 90 && this.input.consumeKey('e')) {
+      this.openJournal('playing');
+    }
+  }
+
+  private openJournal(from: Phase): void {
+    this.journalReturn = from;
+    this.journalViewing = -1;
+    this.phase = 'journal';
+  }
+
+  private updateJournal(): void {
+    if (this.input.consumeKey('escape')) {
+      if (this.journalViewing > 0) this.journalViewing = -1;
+      else this.phase = this.journalReturn;
+      return;
+    }
+    if (!this.input.consumeClick()) return;
+    const mx = this.input.mouseX;
+    const my = this.input.mouseY;
+    if (pointIn(journalBackRect(), mx, my)) {
+      if (this.journalViewing > 0) this.journalViewing = -1;
+      else this.phase = this.journalReturn;
+      return;
+    }
+    if (this.journalViewing < 0) {
+      const id = journalCellAt(mx, my);
+      if (id !== null && this.save.pages.includes(id)) this.journalViewing = id;
+    }
+  }
+
+  // --- combat juice + shared damage application ---
+
+  private damageEnemy(e: Enemy, dmg: number, sx: number, sy: number): void {
+    if (!e.alive) return;
+    e.hurt(dmg);
+    e.knockback(e.x - sx, e.y - sy, Math.min(240, 50 + dmg * 6));
+    // show what actually landed, so armored bosses read honestly (a small grey
+    // number = soaked by armor; the colour cues "this isn't the window").
+    const armor = e instanceof Boss ? e.armorMul : 1;
+    const shown = Math.max(1, Math.round(dmg * armor));
+    this.damageNumbers.push({
+      x: e.x,
+      y: e.y - e.radius,
+      vy: -60,
+      life: 0.55,
+      text: String(shown),
+      color: armor < 1 ? '#7fd8ff' : '#fff3b0',
+    });
+    if (!e.alive) this.onEnemyKilled(e);
+  }
+
+  private onEnemyKilled(e: Enemy): void {
+    this.enemiesDefeated += 1;
+    for (let i = 0; i < 9; i++) this.particles.push(new Particle(e.x, e.y, e.color));
+    // no screen shake on kills — shake is reserved for taking damage
+    this.hitStop = Math.max(this.hitStop, 0.04);
+  }
+
+  private updateEnemyBullets(dt: number): void {
+    const p = this.player;
+    for (const b of this.enemyBullets) {
+      b.update(dt);
+      if (b.x < WALL || b.x > W - WALL || b.y < WALL || b.y > H - WALL) {
+        b.alive = false;
+        continue;
+      }
+      if (p.invuln <= 0 && Math.hypot(p.x - b.x, p.y - b.y) < p.radius + b.radius) {
+        b.alive = false;
+        if (this.hurtPlayer(b.damage, b.x, b.y)) break;
+      }
+    }
+    this.enemyBullets = this.enemyBullets.filter((b) => b.alive);
+  }
+
+  // Returns true if the hit ended the run (and opened the game-over screen).
+  private hurtPlayer(dmg: number, sx: number, sy: number): boolean {
+    const p = this.player;
+    p.hp -= dmg;
+    p.invuln = 1.0;
+    const dx = p.x - sx;
+    const dy = p.y - sy;
+    const d = Math.hypot(dx, dy) || 1;
+    p.x += (dx / d) * 26;
+    p.y += (dy / d) * 26;
+    this.shake = Math.min(14, this.shake + 8); // shake on taking damage
+    this.hitStop = Math.max(this.hitStop, 0.06);
+    if (p.hp <= 0) {
+      this.gameOver();
+      return true;
+    }
+    return false;
+  }
+
+  // The run ends. Record a best and show the summary.
+  private gameOver(): void {
+    this.newBest = this.roomsExplored > this.save.bestRooms;
+    if (this.newBest) {
+      this.save.bestRooms = this.roomsExplored;
+      writeSave(this.save);
+    }
+    this.gameOverAt = this.time;
+    this.phase = 'gameover';
+  }
+
+  // Input is locked for a beat after dying so a frantic click doesn't skip the
+  // summary.
+  private get gameOverReady(): boolean {
+    return this.time - this.gameOverAt > 1.2;
+  }
+
+  private updateFloaters(dt: number): void {
+    for (const f of this.damageNumbers) {
+      f.y += f.vy * dt;
+      f.life -= dt;
+    }
+    this.damageNumbers = this.damageNumbers.filter((f) => f.life > 0);
+    for (const pt of this.particles) pt.update(dt);
+    this.particles = this.particles.filter((pt) => !pt.dead);
+  }
+
+  // Drive the automatic attack-items. They own their own state and rendering;
+  // we just hand them the world (player, enemies, input, damage hook).
   private updateItemAttacks(dt: number): void {
-    this.updateAura(dt);
-    this.updateWheels(dt);
-    this.updateNova(dt);
-    this.updateBolts(dt);
-    this.updateCrumbs(dt);
-    for (const r of this.rings) r.t += dt;
-    this.rings = this.rings.filter((r) => r.t < r.dur);
-  }
-
-  private itemDamage(id: string): number {
-    const lvl = this.player.getItemLevel(id);
-    return ITEMS.find((i) => i.id === id)!.value(this.player.level, lvl);
-  }
-
-  private nearestEnemyTo(x: number, y: number): Enemy | null {
-    let best: Enemy | null = null;
-    let bd = Infinity;
-    for (const e of this.room.enemies) {
-      const d = Math.hypot(e.x - x, e.y - y);
-      if (d < bd) {
-        bd = d;
-        best = e;
-      }
-    }
-    return best;
-  }
-
-  // STINKY AURA — continuous damage to everything in a radius around you.
-  private updateAura(dt: number): void {
-    const lvl = this.player.getItemLevel('aura');
-    if (lvl <= 0) return;
-    this.auraTick -= dt;
-    if (this.auraTick > 0) return;
-    this.auraTick = 0.5;
-    const r = ITEMS.find((i) => i.id === 'aura')!.radius!(this.player.level, lvl);
-    const dmg = this.itemDamage('aura');
-    for (const e of this.room.enemies) {
-      if (Math.hypot(e.x - this.player.x, e.y - this.player.y) <= r + e.radius) e.hurt(dmg);
-    }
-  }
-
-  // CHEESE WHEELS — orbiting wheels that damage whatever they roll over.
-  private updateWheels(dt: number): void {
-    const lvl = this.player.getItemLevel('wheels');
-    if (lvl <= 0) return;
-    this.wheelAngle += dt * 2.4;
-    this.wheelTick -= dt;
-    if (this.wheelTick > 0) return;
-    this.wheelTick = 0.2;
-    const dmg = this.itemDamage('wheels');
-    const count = 1 + lvl;
-    const orbit = 78;
-    for (let k = 0; k < count; k++) {
-      const a = this.wheelAngle + (k * Math.PI * 2) / count;
-      const wx = this.player.x + Math.cos(a) * orbit;
-      const wy = this.player.y + Math.sin(a) * orbit;
-      for (const e of this.room.enemies) {
-        if (Math.hypot(e.x - wx, e.y - wy) <= 11 + e.radius) e.hurt(dmg);
-      }
-    }
-  }
-
-  // CHEESE NOVA — periodic shockwave burst from the player.
-  private updateNova(dt: number): void {
-    const lvl = this.player.getItemLevel('nova');
-    if (lvl <= 0) return;
-    this.novaTick -= dt;
-    if (this.novaTick > 0) return;
-    this.novaTick = Math.max(0.8, 2.5 - lvl * 0.2);
-    const def = ITEMS.find((i) => i.id === 'nova')!;
-    const r = def.radius!(this.player.level, lvl);
-    const dmg = this.itemDamage('nova');
-    for (const e of this.room.enemies) {
-      if (Math.hypot(e.x - this.player.x, e.y - this.player.y) <= r + e.radius) e.hurt(dmg);
-    }
-    this.rings.push({ x: this.player.x, y: this.player.y, t: 0, dur: 0.4, r, color: def.color });
-  }
-
-  // CURD BOLTS — periodically fire a homing glob at the nearest enemy.
-  private updateBolts(dt: number): void {
-    const lvl = this.player.getItemLevel('bolts');
-    if (lvl > 0) {
-      this.boltTick -= dt;
-      if (this.boltTick <= 0) {
-        this.boltTick = Math.max(0.3, 1.0 - lvl * 0.1);
-        const target = this.nearestEnemyTo(this.player.x, this.player.y);
-        if (target) {
-          const a = Math.atan2(target.y - this.player.y, target.x - this.player.x);
-          this.curdBolts.push({ x: this.player.x, y: this.player.y, angle: a, life: 2 });
-        }
-      }
-    }
-    const dmg = this.itemDamage('bolts');
-    for (const b of this.curdBolts) {
-      b.life -= dt;
-      const target = this.nearestEnemyTo(b.x, b.y);
-      if (target) {
-        let d = Math.atan2(target.y - b.y, target.x - b.x) - b.angle;
-        d = Math.atan2(Math.sin(d), Math.cos(d));
-        b.angle += Math.max(-6 * dt, Math.min(6 * dt, d)); // steer toward it
-      }
-      b.x += Math.cos(b.angle) * 320 * dt;
-      b.y += Math.sin(b.angle) * 320 * dt;
-      for (const e of this.room.enemies) {
-        if (Math.hypot(e.x - b.x, e.y - b.y) <= 6 + e.radius) {
-          e.hurt(dmg);
-          b.life = 0;
-          break;
-        }
-      }
-    }
-    this.curdBolts = this.curdBolts.filter((b) => b.life > 0 && b.x > 0 && b.x < W && b.y > 0 && b.y < H);
-  }
-
-  // CRUMB TRAIL — drop damaging crumbs as you move.
-  private updateCrumbs(dt: number): void {
-    const lvl = this.player.getItemLevel('crumbs');
-    if (lvl > 0) {
-      const moving = this.input.isDown('w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright');
-      this.crumbTick -= dt;
-      if (this.crumbTick <= 0 && moving) {
-        this.crumbTick = 0.3;
-        this.crumbs.push({ x: this.player.x, y: this.player.y, life: 3 });
-      }
-    }
-    this.crumbDmgTick -= dt;
-    const doDamage = this.crumbDmgTick <= 0;
-    if (doDamage) this.crumbDmgTick = 0.4;
-    const dmg = this.itemDamage('crumbs');
-    for (const c of this.crumbs) {
-      c.life -= dt;
-      if (doDamage && lvl > 0) {
-        for (const e of this.room.enemies) {
-          if (Math.hypot(e.x - c.x, e.y - c.y) <= 22 + e.radius) e.hurt(dmg);
-        }
-      }
-    }
-    this.crumbs = this.crumbs.filter((c) => c.life > 0);
+    this.items.update(dt, {
+      player: this.player,
+      enemies: this.room.enemies,
+      input: this.input,
+      damageEnemy: (e, dmg, sx, sy) => this.damageEnemy(e, dmg, sx, sy),
+    });
   }
 
   // When you first reach a level milestone (10, 20, ...) and the room is clear,
@@ -328,8 +453,9 @@ export class Game {
     if (this.player.level >= next) this.openPowerup(next);
   }
 
-  private openPowerup(level: number): void {
+  private openPowerup(level: number, title = ''): void {
     this.milestoneLevel = level;
+    this.powerupTitle = title;
     this.powerupOptions = this.rollPowerupOptions();
     this.selectedPowerup = -1; // nothing chosen until confirmed
     this.phase = 'powerup';
@@ -348,12 +474,6 @@ export class Game {
     return pool.slice(0, 3);
   }
 
-  private confirmRect(): { x: number; y: number; w: number; h: number } {
-    const w = 240;
-    const h = 48;
-    return { x: (W - w) / 2, y: 512, w, h };
-  }
-
   private updatePowerup(): void {
     // keys just highlight a card; they never commit
     for (let i = 0; i < this.powerupOptions.length; i++) {
@@ -364,15 +484,17 @@ export class Game {
       return;
     }
     if (!this.input.consumeClick()) return;
+    const mx = this.input.mouseX;
+    const my = this.input.mouseY;
     // a click on a card only selects it
     for (let i = 0; i < this.powerupOptions.length; i++) {
-      if (this.hovered(this.cardRect(i))) {
+      if (pointIn(cardRect(i), mx, my)) {
         this.selectedPowerup = i;
         return;
       }
     }
     // ...applying only happens via the confirm button
-    if (this.selectedPowerup >= 0 && this.hovered(this.confirmRect())) this.applyPowerup();
+    if (this.selectedPowerup >= 0 && pointIn(confirmRect(), mx, my)) this.applyPowerup();
   }
 
   private applyPowerup(): void {
@@ -386,25 +508,52 @@ export class Game {
 
   private updateEnemies(dt: number): void {
     const p = this.player;
+    const adds: Enemy[] = [];
     for (const e of this.room.enemies) {
       e.update(dt, p.x, p.y);
-      if (p.invuln <= 0 && e.alive) {
-        const dx = p.x - e.x;
-        const dy = p.y - e.y;
-        const dist = Math.hypot(dx, dy);
-        if (dist < p.radius + e.radius) {
-          p.hp -= e.damage;
-          p.invuln = 1.0;
-          const k = 26 / (dist || 1);
-          p.x += dx * k;
-          p.y += dy * k;
-          if (p.hp <= 0) {
-            this.respawn();
-            return;
+
+      // spitters request a shot — spawn it here
+      if (e.wantsFire) {
+        e.wantsFire = false;
+        this.enemyBullets.push(new EnemyBullet(e.x, e.y, e.fireAngle, 230, e.damage, '#c7ff8a'));
+      }
+
+      if (e instanceof Boss) {
+        // queued projectiles (Tuna mayo rings, Croque egg-spreads, ...)
+        if (e.shots.length) {
+          const bdmg = Math.max(1, Math.round(e.damage * 0.6));
+          for (const s of e.shots)
+            this.enemyBullets.push(new EnemyBullet(e.x, e.y, s.angle, s.speed, bdmg, e.color));
+          e.shots.length = 0;
+        }
+        // filling-adds, capped so the arena never truly swarms
+        if (e.wantsSpawn > 0) {
+          const here = this.room.enemies.length + adds.length;
+          for (let i = 0; i < e.wantsSpawn && here + i < 11; i++) {
+            const a = Math.random() * Math.PI * 2;
+            const ax = Math.max(WALL + 20, Math.min(W - WALL - 20, e.x + Math.cos(a) * 50));
+            const ay = Math.max(WALL + 20, Math.min(H - WALL - 20, e.y + Math.sin(a) * 50));
+            adds.push(new Enemy(ax, ay, this.roomsExplored, this.bossesDefeated, e.config.addKind));
           }
+          e.wantsSpawn = 0;
+        }
+        // Croque's Madame — a one-time elite, bypasses the add cap
+        if (e.wantsMadame) {
+          e.wantsMadame = false;
+          const mx = Math.max(WALL + 20, Math.min(W - WALL - 20, e.x + 60));
+          const madame = new Enemy(mx, e.y, this.roomsExplored, this.bossesDefeated, 'bruiser');
+          madame.maxHp = Math.round(madame.maxHp * 1.6);
+          madame.hp = madame.maxHp;
+          adds.push(madame);
         }
       }
+
+      if (p.invuln <= 0 && e.alive) {
+        const dist = Math.hypot(p.x - e.x, p.y - e.y);
+        if (dist < p.radius + e.radius && this.hurtPlayer(e.damage, e.x, e.y)) return;
+      }
     }
+    if (adds.length) this.room.enemies.push(...adds);
   }
 
   // Sword hits everything inside the 180° arc within reach, once per swing.
@@ -419,33 +568,51 @@ export class Game {
       let d = Math.atan2(dy, dx) - p.swingAim;
       d = Math.atan2(Math.sin(d), Math.cos(d)); // normalise to [-π, π]
       if (Math.abs(d) <= Math.PI / 2) {
-        e.hurt(this.damageFor(SWORD_DMG));
+        this.damageEnemy(e, this.damageFor(SWORD_DMG), p.x, p.y);
         this.swordHit.add(e);
       }
     }
   }
 
-  // Remove dead enemies and award their XP.
+  // Remove dead enemies, award their XP, and spawn splitter children.
   private reapEnemies(): void {
     const survivors: Enemy[] = [];
     for (const e of this.room.enemies) {
-      if (e.alive) survivors.push(e);
-      else this.player.gainXp(e.xpReward);
+      if (e.alive) {
+        survivors.push(e);
+        continue;
+      }
+      this.player.gainXp(e.xpReward);
+      if (e instanceof Boss) {
+        this.onBossDefeated(e);
+        continue;
+      }
+      if (e.canSplit) {
+        for (const off of [-1, 1]) {
+          const child = new Enemy(e.x + off * 16, e.y, this.roomsExplored, e.tier, 'chaser');
+          child.maxHp = Math.max(1, Math.round(e.maxHp * 0.35));
+          child.hp = child.maxHp;
+          child.canSplit = false;
+          survivors.push(child);
+        }
+      }
     }
     this.room.enemies = survivors;
   }
 
-  private respawn(): void {
-    const p = this.player;
-    p.hp = p.maxHp;
-    p.invuln = 1.5;
-    this.rx = 0;
-    this.ry = 0;
-    this.room = this.getRoom(0, 0);
-    this.pruneRooms();
-    p.x = W / 2;
-    p.y = H / 2;
-    this.clearEffects();
+  // A Pretender Melt has been corrected. Unseal the room, celebrate, and either
+  // win the run (final boss) or hand out a guaranteed reward.
+  private onBossDefeated(boss: Boss): void {
+    this.bossActive = false;
+    this.bossesDefeated += 1;
+    for (let i = 0; i < 28; i++) this.particles.push(new Particle(boss.x, boss.y, boss.color));
+    this.hitStop = Math.max(this.hitStop, 0.12); // freeze for punch; no shake on a kill
+    if (boss.config.final) {
+      this.phase = 'won';
+      return;
+    }
+    // guaranteed reward, framed as a purist victory rather than a level-up
+    this.openPowerup(this.lastMilestoneAwarded, 'HERESY PURGED'); // milestone stays put
   }
 
   // All weapons scale off character level so offense keeps pace as you grow,
@@ -471,7 +638,7 @@ export class Game {
       const blast = new Explosion(x, y, this.spec?.color ?? '#6c9cff');
       this.explosions.push(blast);
       for (const e of this.room.enemies) {
-        if (Math.hypot(e.x - x, e.y - y) <= blast.maxRadius + e.radius) e.hurt(this.damageFor(BLAST_DMG));
+        if (Math.hypot(e.x - x, e.y - y) <= blast.maxRadius + e.radius) this.damageEnemy(e, this.damageFor(BLAST_DMG), x, y);
       }
       p.fireCooldown = 0.45;
     }
@@ -488,7 +655,7 @@ export class Game {
       // ...or on the first enemy they strike
       for (const e of this.room.enemies) {
         if (e.alive && Math.hypot(e.x - ar.x, e.y - ar.y) < e.radius + ar.radius) {
-          e.hurt(this.damageFor(ARROW_DMG));
+          this.damageEnemy(e, this.damageFor(ARROW_DMG), ar.x, ar.y);
           ar.alive = false;
           break;
         }
@@ -500,370 +667,156 @@ export class Game {
   // Pixel-art world — rendered into the low-res buffer so it stays chunky.
   drawWorld(ctx: CanvasRenderingContext2D): void {
     if (this.phase === 'select') return; // world is visible while playing or choosing a powerup
-    this.room.draw(ctx);
-    this.drawAura(ctx);
-    this.drawCrumbs(ctx);
-    this.drawRings(ctx);
+    ctx.save();
+    if (this.shake > 0) {
+      ctx.translate((Math.random() - 0.5) * this.shake, (Math.random() - 0.5) * this.shake);
+    }
+    this.room.draw(ctx, this.save.pages.length);
+    this.drawSeals(ctx);
+    this.items.drawUnder(ctx, this.player, this.time);
+    for (const pg of this.room.pages) pg.draw(ctx);
+    if (this.room.heal) this.room.heal.draw(ctx);
     for (const e of this.room.enemies) e.draw(ctx);
-    this.drawWheels(ctx);
-    this.drawBolts(ctx);
+    this.items.drawOver(ctx, this.player);
+    for (const b of this.enemyBullets) b.draw(ctx);
     for (const ar of this.arrows) ar.draw(ctx);
     this.player.draw(ctx);
     for (const ex of this.explosions) ex.draw(ctx);
-  }
-
-  private drawWheels(ctx: CanvasRenderingContext2D): void {
-    const lvl = this.player.getItemLevel('wheels');
-    if (lvl <= 0) return;
-    const count = 1 + lvl;
-    const orbit = 78;
-    for (let k = 0; k < count; k++) {
-      const a = this.wheelAngle + (k * Math.PI * 2) / count;
-      const wx = this.player.x + Math.cos(a) * orbit;
-      const wy = this.player.y + Math.sin(a) * orbit;
-      ctx.fillStyle = '#ffd23f';
-      ctx.beginPath();
-      ctx.arc(wx, wy, 11, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.lineWidth = 2;
-      ctx.strokeStyle = '#e0a818';
-      ctx.stroke();
-      ctx.fillStyle = '#cf8f0c';
-      ctx.beginPath();
-      ctx.arc(wx - 3, wy - 2, 1.8, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.beginPath();
-      ctx.arc(wx + 3, wy + 2, 1.5, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  }
-
-  private drawBolts(ctx: CanvasRenderingContext2D): void {
-    for (const b of this.curdBolts) {
-      ctx.fillStyle = '#fff3b0';
-      ctx.beginPath();
-      ctx.arc(b.x, b.y, 5, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = '#cf8f0c';
-      ctx.beginPath();
-      ctx.arc(b.x, b.y - 1, 1.4, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  }
-
-  private drawCrumbs(ctx: CanvasRenderingContext2D): void {
-    for (const c of this.crumbs) {
-      ctx.save();
-      ctx.globalAlpha = 0.55 * Math.min(1, c.life / 3);
-      ctx.fillStyle = '#e8b04a';
-      ctx.fillRect(c.x - 9, c.y - 3, 6, 6);
-      ctx.fillRect(c.x + 2, c.y + 1, 5, 5);
-      ctx.fillRect(c.x - 2, c.y + 5, 4, 4);
-      ctx.restore();
-    }
-  }
-
-  private drawRings(ctx: CanvasRenderingContext2D): void {
-    for (const ring of this.rings) {
-      const p = ring.t / ring.dur;
-      ctx.save();
-      ctx.globalAlpha = 0.5 * (1 - p);
-      ctx.lineWidth = 4;
-      ctx.strokeStyle = ring.color;
-      ctx.beginPath();
-      ctx.arc(ring.x, ring.y, ring.r * p, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.restore();
-    }
-  }
-
-  private drawAura(ctx: CanvasRenderingContext2D): void {
-    const lvl = this.player.getItemLevel('aura');
-    if (lvl <= 0) return;
-    const def = ITEMS.find((i) => i.id === 'aura')!;
-    const r = def.radius!(this.player.level, lvl);
-    const pulse = 0.5 + 0.5 * Math.sin(this.time * 4);
-    ctx.save();
-    ctx.fillStyle = def.color;
-    ctx.globalAlpha = 0.1 + 0.05 * pulse;
-    ctx.beginPath();
-    ctx.arc(this.player.x, this.player.y, r, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.globalAlpha = 0.35;
-    ctx.lineWidth = 2;
-    ctx.strokeStyle = def.color;
-    ctx.beginPath();
-    ctx.arc(this.player.x, this.player.y, r, 0, Math.PI * 2);
-    ctx.stroke();
+    for (const pt of this.particles) pt.draw(ctx);
     ctx.restore();
   }
 
+  // The room is locked (no exits) during a boss fight or while any vermin live.
+  private roomLocked(): boolean {
+    return this.bossActive || this.room.enemies.length > 0;
+  }
+
+  // Bars across every open doorway while the room is locked. Toasted bread for a
+  // boss arena, plain stone elsewhere.
+  private drawSeals(ctx: CanvasRenderingContext2D): void {
+    if (!this.roomLocked()) return;
+    const t = WALL;
+    const d = this.room.doors;
+    const gx = W / 2 - DOOR_HALF;
+    const gw = DOOR_HALF * 2;
+    const gy = H / 2 - DOOR_HALF;
+    const gh = DOOR_HALF * 2;
+    ctx.fillStyle = this.bossActive ? '#caa24a' : '#6b6488';
+    if (d.north) ctx.fillRect(gx, 0, gw, t);
+    if (d.south) ctx.fillRect(gx, H - t, gw, t);
+    if (d.west) ctx.fillRect(0, gy, t, gh);
+    if (d.east) ctx.fillRect(W - t, gy, t, gh);
+    // inner accent line
+    ctx.fillStyle = this.bossActive ? '#9c6b2e' : '#4a4360';
+    if (d.north) ctx.fillRect(gx, t - 3, gw, 3);
+    if (d.south) ctx.fillRect(gx, H - t, gw, 3);
+    if (d.west) ctx.fillRect(t - 3, gy, 3, gh);
+    if (d.east) ctx.fillRect(W - t, gy, 3, gh);
+  }
+
   // UI — rendered at full resolution on the main canvas so text stays sharp.
+  // The phase decides which screen; rendering itself lives in ui/.
   drawOverlay(ctx: CanvasRenderingContext2D): void {
+    const mx = this.input.mouseX;
+    const my = this.input.mouseY;
     if (this.phase === 'select') {
-      this.drawSelect(ctx);
+      drawSelect(ctx, { time: this.time, save: this.save, mx, my });
       return;
     }
     if (this.phase === 'powerup') {
-      this.drawStatus(ctx);
-      this.drawPowerup(ctx);
+      if (this.spec) drawStatus(ctx, this.player, this.spec);
+      drawPowerup(ctx, {
+        options: this.powerupOptions,
+        selected: this.selectedPowerup,
+        milestoneLevel: this.milestoneLevel,
+        title: this.powerupTitle,
+        player: this.player,
+        mx,
+        my,
+      });
       return;
     }
-    this.drawMinimap(ctx);
-    this.drawStatus(ctx);
-    this.drawItems(ctx);
-  }
-
-  // Bottom-right tray: 3 slots that fill in as you collect unique items.
-  private drawItems(ctx: CanvasRenderingContext2D): void {
-    const slots = 3;
-    const box = 44;
-    const gap = 8;
-    const x0 = W - 18 - (slots * box + (slots - 1) * gap);
-    const y0 = H - 18 - box;
-
-    ctx.textAlign = 'left';
-    ctx.fillStyle = '#8a83a8';
-    ctx.font = `8px ${FONT}`;
-    ctx.fillText('ITEMS', x0, y0 - 7);
-
-    let hovered = -1;
-    for (let i = 0; i < slots; i++) {
-      const eq = this.player.equipped[i];
-      const def = eq ? ITEMS.find((it) => it.id === eq.id) : undefined;
-      const bx = x0 + i * (box + gap);
-      const over =
-        this.input.mouseX >= bx &&
-        this.input.mouseX <= bx + box &&
-        this.input.mouseY >= y0 &&
-        this.input.mouseY <= y0 + box;
-
-      ctx.fillStyle = def ? '#171226' : 'rgba(0, 0, 0, 0.4)';
-      ctx.fillRect(bx, y0, box, box);
-      ctx.lineWidth = def && over ? 3 : 2;
-      ctx.strokeStyle = def ? def.color : '#3a3a44';
-      ctx.strokeRect(bx, y0, box, box);
-
-      if (def && eq) {
-        this.drawItemIcon(ctx, def.id, bx + box / 2, y0 + box / 2 - 1, def.color);
-        // level number in the bottom-right corner
-        ctx.textAlign = 'right';
-        ctx.fillStyle = '#fff3b0';
-        ctx.font = `8px ${FONT}`;
-        ctx.fillText(String(eq.level), bx + box - 4, y0 + box - 4);
-        if (over) hovered = i;
-      }
+    if (this.phase === 'won') {
+      drawWon(ctx, { roomsExplored: this.roomsExplored, level: this.player.level, time: this.time });
+      return;
     }
-
-    if (hovered >= 0) {
-      const def = ITEMS.find((it) => it.id === this.player.equipped[hovered].id)!;
-      this.drawItemTooltip(ctx, def, y0);
+    if (this.phase === 'journal') {
+      drawJournal(ctx, { collected: this.save.pages, viewing: this.journalViewing, mx, my });
+      return;
     }
-    ctx.textAlign = 'left';
-  }
-
-  // Cheese-themed pixel icons for each attack item.
-  private drawItemIcon(ctx: CanvasRenderingContext2D, id: string, cx: number, cy: number, color: string): void {
-    const wedge = (yColor: string) => {
-      ctx.fillStyle = yColor;
-      ctx.beginPath();
-      ctx.moveTo(cx - 9, cy + 7);
-      ctx.lineTo(cx + 9, cy + 7);
-      ctx.lineTo(cx + 9, cy - 4);
-      ctx.closePath();
-      ctx.fill();
-      ctx.fillStyle = '#cf8f0c';
-      ctx.beginPath();
-      ctx.arc(cx + 2, cy + 3, 1.6, 0, Math.PI * 2);
-      ctx.fill();
-    };
-
-    if (id === 'aura') {
-      // cheese wedge with rising stink lines
-      wedge('#ffd23f');
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(cx - 5, cy - 6);
-      ctx.quadraticCurveTo(cx - 2, cy - 9, cx - 5, cy - 12);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(cx + 1, cy - 7);
-      ctx.quadraticCurveTo(cx + 4, cy - 10, cx + 1, cy - 13);
-      ctx.stroke();
-    } else if (id === 'wheels') {
-      // cheese wheel with a cut slice
-      ctx.fillStyle = '#ffd23f';
-      ctx.beginPath();
-      ctx.arc(cx, cy, 11, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = '#171226';
-      ctx.beginPath();
-      ctx.moveTo(cx, cy);
-      ctx.arc(cx, cy, 11, -0.5, 0.5);
-      ctx.closePath();
-      ctx.fill();
-      ctx.lineWidth = 2;
-      ctx.strokeStyle = '#e0a818';
-      ctx.beginPath();
-      ctx.arc(cx, cy, 11, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.fillStyle = '#cf8f0c';
-      ctx.beginPath();
-      ctx.arc(cx - 3, cy - 2, 1.6, 0, Math.PI * 2);
-      ctx.fill();
-    } else if (id === 'nova') {
-      // bursting cheese core
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 2;
-      for (let k = 0; k < 8; k++) {
-        const a = (k * Math.PI) / 4;
-        ctx.beginPath();
-        ctx.moveTo(cx + Math.cos(a) * 6, cy + Math.sin(a) * 6);
-        ctx.lineTo(cx + Math.cos(a) * 12, cy + Math.sin(a) * 12);
-        ctx.stroke();
-      }
-      ctx.fillStyle = '#ffd23f';
-      ctx.beginPath();
-      ctx.arc(cx, cy, 5, 0, Math.PI * 2);
-      ctx.fill();
-    } else if (id === 'bolts') {
-      // curd glob with a streak
-      ctx.strokeStyle = '#e0a818';
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(cx - 12, cy + 7);
-      ctx.lineTo(cx - 1, cy + 1);
-      ctx.stroke();
-      ctx.fillStyle = '#fff3b0';
-      ctx.beginPath();
-      ctx.arc(cx + 3, cy - 2, 7, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = '#cf8f0c';
-      ctx.beginPath();
-      ctx.arc(cx + 1, cy - 3, 1.5, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.beginPath();
-      ctx.arc(cx + 5, cy, 1.3, 0, Math.PI * 2);
-      ctx.fill();
-    } else {
-      // crumbs — scattered cheese bits
-      ctx.fillStyle = color;
-      ctx.fillRect(cx - 10, cy - 2, 5, 5);
-      ctx.fillRect(cx - 2, cy - 7, 6, 6);
-      ctx.fillRect(cx + 4, cy + 2, 5, 5);
-      ctx.fillRect(cx - 4, cy + 4, 4, 4);
+    if (this.phase === 'gameover') {
+      drawGameOver(ctx, {
+        enemies: this.enemiesDefeated,
+        rooms: this.roomsExplored,
+        level: this.player.level,
+        bosses: this.bossesDefeated,
+        pages: this.pagesFoundThisRun,
+        seconds: this.time - this.runStart,
+        bestRooms: this.save.bestRooms,
+        newBest: this.newBest,
+        ready: this.gameOverReady,
+        time: this.time,
+      });
+      return;
     }
-  }
-
-  private drawItemTooltip(ctx: CanvasRenderingContext2D, def: Item, trayY: number): void {
-    const lvl = this.player.getItemLevel(def.id);
-    const tw = 250;
-    const th = 64;
-    const tx = W - 18 - tw;
-    const ty = trayY - 12 - th;
-    const pad = 12;
-
-    ctx.fillStyle = 'rgba(8, 6, 14, 0.95)';
-    ctx.fillRect(tx, ty, tw, th);
-    ctx.lineWidth = 2;
-    ctx.strokeStyle = def.color;
-    ctx.strokeRect(tx, ty, tw, th);
-
+    drawFloaters(ctx, this.damageNumbers);
+    drawMinimap(ctx, this.rooms, this.rx, this.ry);
+    // current zone name, under the minimap
     ctx.textAlign = 'left';
-    ctx.fillStyle = def.color;
-    ctx.font = `12px ${FONT}`;
-    ctx.fillText(def.name, tx + pad, ty + 22);
-    ctx.fillStyle = '#8a83a8';
+    ctx.fillStyle = this.room.isLibrary ? '#caa24a' : this.room.isSafe ? '#ff9d3f' : '#8a83a8';
     ctx.font = `9px ${FONT}`;
-    ctx.fillText(`LEVEL ${lvl}`, tx + pad, ty + 40);
-    ctx.fillStyle = '#fff3b0';
-    ctx.font = `10px ${FONT}`;
-    ctx.fillText(def.describe(this.player.level, lvl), tx + pad, ty + 56);
+    ctx.fillText(this.room.zone, 20, 152);
+    if (this.spec) drawStatus(ctx, this.player, this.spec);
+    drawItems(ctx, this.player, mx, my);
+    if (this.bossActive) {
+      const boss = this.room.enemies.find((e) => e instanceof Boss) as Boss | undefined;
+      if (boss) drawBoss(ctx, boss);
+    }
+    this.drawReaderPrompt(ctx);
+    this.drawToast(ctx);
   }
 
-  private drawPowerup(ctx: CanvasRenderingContext2D): void {
-    ctx.fillStyle = 'rgba(16, 12, 28, 0.82)';
-    ctx.fillRect(0, 0, W, H);
-
+  // "PRESS E TO READ" near the library desk.
+  private drawReaderPrompt(ctx: CanvasRenderingContext2D): void {
+    const p = this.player;
+    if (!this.room.isLibrary) return;
+    if (Math.hypot(p.x - W / 2, p.y - (H / 2 + 30)) >= 90) return;
     ctx.textAlign = 'center';
     ctx.fillStyle = '#ffd23f';
-    ctx.font = `30px ${FONT}`;
-    ctx.fillText(`LEVEL ${this.milestoneLevel}`, W / 2, 110);
-    ctx.fillStyle = '#fff3b0';
+    ctx.font = `12px ${FONT}`;
+    ctx.fillText('PRESS E TO READ', W / 2, H / 2 - 60);
+  }
+
+  // Brief banner for a page pickup or a heal.
+  private drawToast(ctx: CanvasRenderingContext2D): void {
+    if (this.toast.life <= 0) return;
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, this.toast.life);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ffe27a';
     ctx.font = `14px ${FONT}`;
-    ctx.fillText('CHOOSE A POWER', W / 2, 158);
-    ctx.fillStyle = '#8a83a8';
-    ctx.font = `9px ${FONT}`;
-    ctx.fillText('SELECT A CARD, THEN CONFIRM', W / 2, 188);
-
-    for (let i = 0; i < this.powerupOptions.length; i++) {
-      const item = this.powerupOptions[i];
-      const r = this.cardRect(i);
-      const selected = i === this.selectedPowerup;
-      const hot = selected || this.hovered(r);
-      const cx = r.x + r.w / 2;
-      const owned = this.player.getItemLevel(item.id);
-      const nextLevel = owned + 1;
-
-      ctx.fillStyle = selected ? '#1f2e1f' : hot ? '#241a36' : '#1a1428';
-      ctx.fillRect(r.x, r.y, r.w, r.h);
-      ctx.fillStyle = selected ? '#5ad36a' : item.color;
-      ctx.fillRect(r.x, r.y, r.w, 6);
-      ctx.lineWidth = selected || hot ? 4 : 2;
-      ctx.strokeStyle = selected ? '#5ad36a' : hot ? '#ffd23f' : '#4a4360';
-      ctx.strokeRect(r.x + 2, r.y + 2, r.w - 4, r.h - 4);
-
-      ctx.fillStyle = '#ffd23f';
-      ctx.font = `16px ${FONT}`;
-      this.wrapText(ctx, item.name, cx, r.y + 52, r.w - 24, 24);
-      ctx.fillStyle = owned > 0 ? '#5ad36a' : '#8a83a8';
-      ctx.font = `10px ${FONT}`;
-      ctx.fillText(owned > 0 ? `LVL ${owned} -> ${nextLevel}` : 'NEW ITEM', cx, r.y + 104);
-      ctx.fillStyle = '#fff3b0';
-      ctx.font = `12px ${FONT}`;
-      this.wrapText(ctx, item.describe(this.player.level, nextLevel), cx, r.y + 140, r.w - 28, 24);
-
-      ctx.fillStyle = selected ? '#5ad36a' : hot ? '#ffd23f' : '#6a6388';
-      ctx.font = `12px ${FONT}`;
-      ctx.fillText(selected ? 'SELECTED' : `PRESS ${i + 1}`, cx, r.y + r.h - 20);
+    ctx.fillText(this.toast.text, W / 2, 80);
+    if (this.toast.sub) {
+      ctx.fillStyle = '#8a83a8';
+      ctx.font = `9px ${FONT}`;
+      ctx.fillText(this.toast.sub, W / 2, 100);
     }
-
-    // confirm button — only active once a card is selected
-    const cr = this.confirmRect();
-    const ready = this.selectedPowerup >= 0;
-    const chot = ready && this.hovered(cr);
-    ctx.fillStyle = ready ? (chot ? '#5ad36a' : '#243524') : '#161620';
-    ctx.fillRect(cr.x, cr.y, cr.w, cr.h);
-    ctx.lineWidth = 3;
-    ctx.strokeStyle = ready ? '#5ad36a' : '#3a3a44';
-    ctx.strokeRect(cr.x, cr.y, cr.w, cr.h);
-    ctx.fillStyle = ready ? (chot ? '#0d1a0d' : '#ffffff') : '#55556a';
-    ctx.font = `16px ${FONT}`;
-    ctx.fillText('CONFIRM', cr.x + cr.w / 2, cr.y + cr.h / 2 + 6);
+    ctx.restore();
   }
 
   // --- specialization select ---
 
-  private cardRect(i: number): { x: number; y: number; w: number; h: number } {
-    const w = 252;
-    const h = 246;
-    const gap = 24;
-    const total = SPECS.length * w + (SPECS.length - 1) * gap;
-    return { x: (W - total) / 2 + i * (w + gap), y: 234, w, h };
-  }
-
-  private hovered(r: { x: number; y: number; w: number; h: number }): boolean {
-    const mx = this.input.mouseX;
-    const my = this.input.mouseY;
-    return mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h;
-  }
-
   private updateSelect(): void {
     const clicked = this.input.consumeClick();
+    const mx = this.input.mouseX;
+    const my = this.input.mouseY;
+    if (clicked && pointIn(journalButtonRect(), mx, my)) {
+      this.openJournal('select');
+      return;
+    }
     for (let i = 0; i < SPECS.length; i++) {
       const pickedByKey = this.input.isDown(String(i + 1));
-      if ((clicked && this.hovered(this.cardRect(i))) || pickedByKey) {
+      if ((clicked && pointIn(cardRect(i), mx, my)) || pickedByKey) {
         this.selectSpec(SPECS[i]);
         return;
       }
@@ -879,6 +832,11 @@ export class Game {
 
     // fresh world for the run
     this.roomsExplored = 0;
+    this.bossesDefeated = 0;
+    this.bossActive = false;
+    this.enemiesDefeated = 0;
+    this.pagesFoundThisRun = 0;
+    this.runStart = this.time;
     this.rooms.clear();
     this.rx = 0;
     this.ry = 0;
@@ -887,7 +845,6 @@ export class Game {
     this.player.x = W / 2;
     this.player.y = H / 2;
     this.clearEffects();
-    this.auraTick = 0;
     this.phase = 'playing';
 
     // remember this choice for next time
@@ -897,180 +854,4 @@ export class Game {
     writeSave(this.save);
   }
 
-  private drawSelect(ctx: CanvasRenderingContext2D): void {
-    ctx.fillStyle = '#100c1c';
-    ctx.fillRect(0, 0, W, H);
-
-    ctx.textAlign = 'center';
-    ctx.fillStyle = '#ffd23f';
-    ctx.font = `40px ${FONT}`;
-    ctx.fillText('CHEESE WIZARD', W / 2, 110);
-    ctx.fillStyle = '#fff3b0';
-    ctx.font = `16px ${FONT}`;
-    ctx.fillText('CHOOSE YOUR PATH', W / 2, 174);
-
-    for (let i = 0; i < SPECS.length; i++) {
-      const spec = SPECS[i];
-      const r = this.cardRect(i);
-      const hot = this.hovered(r);
-      const cx = r.x + r.w / 2;
-
-      // hard-edged panel with a double border
-      ctx.fillStyle = hot ? '#241a36' : '#1a1428';
-      ctx.fillRect(r.x, r.y, r.w, r.h);
-      ctx.fillStyle = spec.color;
-      ctx.fillRect(r.x, r.y, r.w, 6); // top accent bar
-      ctx.lineWidth = hot ? 4 : 2;
-      ctx.strokeStyle = hot ? spec.color : '#4a4360';
-      ctx.strokeRect(r.x + 2, r.y + 2, r.w - 4, r.h - 4);
-
-      ctx.fillStyle = spec.color;
-      ctx.font = `16px ${FONT}`;
-      this.wrapText(ctx, spec.name.toUpperCase(), cx, r.y + 48, r.w - 24, 24);
-      ctx.fillStyle = '#b8b0d0';
-      ctx.font = `11px ${FONT}`;
-      ctx.fillText(spec.title.toUpperCase(), cx, r.y + 98);
-
-      ctx.fillStyle = '#fff3b0';
-      ctx.font = `12px ${FONT}`;
-      spec.perks.forEach((perk, p) => ctx.fillText(perk.toUpperCase(), cx, r.y + 142 + p * 30));
-
-      ctx.fillStyle = hot ? spec.color : '#6a6388';
-      ctx.font = `12px ${FONT}`;
-      ctx.fillText(`PRESS ${i + 1}`, cx, r.y + r.h - 20);
-
-      // marker on the spec you played last time
-      if (spec.id === this.save.lastSpec) {
-        ctx.fillStyle = spec.color;
-        ctx.font = `10px ${FONT}`;
-        ctx.fillText('LAST PICK', cx, r.y - 14);
-      }
-    }
-
-    if (Math.floor(this.time * 2) % 2 === 0) {
-      ctx.fillStyle = '#ffd23f';
-      ctx.font = `14px ${FONT}`;
-      ctx.fillText('CLICK A CARD OR PRESS 1-3', W / 2, H - 52);
-    }
-
-    // persisted stats — proof it remembers you across visits
-    ctx.fillStyle = '#6a6388';
-    ctx.font = `10px ${FONT}`;
-    ctx.fillText(`VISITS ${this.save.visits}    RUNS ${totalRuns(this.save)}`, W / 2, H - 22);
-  }
-
-  private wrapText(
-    ctx: CanvasRenderingContext2D,
-    text: string,
-    cx: number,
-    y: number,
-    maxWidth: number,
-    lineHeight: number,
-  ): void {
-    const words = text.split(' ');
-    let line = '';
-    let yy = y;
-    for (const word of words) {
-      const test = line ? `${line} ${word}` : word;
-      if (ctx.measureText(test).width > maxWidth && line) {
-        ctx.fillText(line, cx, yy);
-        line = word;
-        yy += lineHeight;
-      } else {
-        line = test;
-      }
-    }
-    ctx.fillText(line, cx, yy);
-  }
-
-  private drawStatus(ctx: CanvasRenderingContext2D): void {
-    if (!this.spec) return;
-    const p = this.player;
-    ctx.textAlign = 'left';
-
-    const bx = 20;
-    const bw = 260;
-    const bh = 12;
-
-    // HP bar
-    const hpY = H - 72;
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
-    ctx.fillRect(bx, hpY, bw, bh);
-    ctx.fillStyle = '#5ad36a';
-    ctx.fillRect(bx, hpY, bw * Math.max(0, p.hp / p.maxHp), bh);
-    ctx.strokeStyle = '#4a4360';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(bx, hpY, bw, bh);
-    ctx.fillStyle = '#ffffff';
-    ctx.font = `8px ${FONT}`;
-    ctx.fillText(`HP ${Math.ceil(p.hp)}/${p.maxHp}`, bx + 6, hpY + 9);
-
-    // XP bar
-    const by = H - 46;
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
-    ctx.fillRect(bx, by, bw, bh);
-    ctx.fillStyle = this.spec.color;
-    ctx.fillRect(bx, by, bw * Math.min(1, p.xp / p.xpToNext), bh);
-    ctx.strokeStyle = '#4a4360';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(bx, by, bw, bh);
-    ctx.fillStyle = '#fff3b0';
-    ctx.font = `8px ${FONT}`;
-    ctx.fillText(`XP ${Math.floor(p.xp)}/${p.xpToNext}`, bx + 6, by + 9);
-
-    // level + spec
-    ctx.fillStyle = this.spec.color;
-    ctx.fillRect(20, H - 26, 12, 12);
-    ctx.fillStyle = '#fff3b0';
-    ctx.font = `12px ${FONT}`;
-    ctx.fillText(`LV ${p.level}  ${this.spec.name.toUpperCase()}`, 38, H - 16);
-  }
-
-  // A fixed 3x3 window centred on the current room: the centre cell is always
-  // the current room, the 8 surrounding slots show explored neighbours
-  // (orthogonal and diagonal) when they've been visited.
-  // 5x5 window centred on the player — the rooms that are currently "live".
-  private drawMinimap(ctx: CanvasRenderingContext2D): void {
-    const span = 2; // 2 each way -> 5x5
-    const cell = 14;
-    const step = 22;
-    const stub = (step - cell) / 2;
-    const thick = 2;
-    const pad = 9;
-    const ox = 18;
-    const oy = 18;
-    const cx0 = ox + pad;
-    const cy0 = oy + pad;
-    const panel = (2 * span + 1) * step - (step - cell) + pad * 2;
-
-    ctx.save();
-    ctx.fillStyle = 'rgba(8, 6, 14, 0.7)';
-    ctx.fillRect(ox, oy, panel, panel);
-    ctx.strokeStyle = '#4a4360';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(ox + 1, oy + 1, panel - 2, panel - 2);
-
-    for (let gy = -span; gy <= span; gy++) {
-      for (let gx = -span; gx <= span; gx++) {
-        const room = this.rooms.get(`${this.rx + gx},${this.ry + gy}`);
-        if (!room) continue;
-        const px = cx0 + (gx + span) * step;
-        const py = cy0 + (gy + span) * step;
-        const midX = px + cell / 2;
-        const midY = py + cell / 2;
-
-        // door stubs pointing toward each opening
-        ctx.fillStyle = '#8a83a8';
-        if (room.doors.east) ctx.fillRect(px + cell, midY - thick / 2, stub, thick);
-        if (room.doors.west) ctx.fillRect(px - stub, midY - thick / 2, stub, thick);
-        if (room.doors.south) ctx.fillRect(midX - thick / 2, py + cell, thick, stub);
-        if (room.doors.north) ctx.fillRect(midX - thick / 2, py - stub, thick, stub);
-
-        const current = gx === 0 && gy === 0;
-        ctx.fillStyle = current ? '#ffd23f' : '#8a83a8';
-        ctx.fillRect(px, py, cell, cell);
-      }
-    }
-    ctx.restore();
-  }
 }
